@@ -55,20 +55,58 @@ def unbound_control(commands, input=None, output_stream=None):
         nl='\n'
         input_string = f'{nl.join(input)}{nl}'
 
-    # XXX invoke can fail (non-zero exit code), but unclear why and what to do
-    subprocess.run(['/usr/sbin/chroot', '-u', 'unbound', '-g', 'unbound', '/',
-                    '/usr/local/sbin/unbound-control', '-c', '/var/unbound/unbound.conf'] + commands,
-                   input=input_string, stdout=output_stream, stderr=subprocess.STDOUT, text=True)
+    result = subprocess.run(['/usr/sbin/chroot', '-u', 'unbound', '-g', 'unbound', '/',
+                             '/usr/local/sbin/unbound-control', '-c', '/var/unbound/unbound.conf'] + commands,
+                            input=input_string, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    if output_stream and result.stdout:
+        output_stream.write(result.stdout.encode())
+
+    if result.returncode != 0:
+        syslog.syslog(
+            syslog.LOG_ERR,
+            'unbound-control %s failed with exit code %d: %s' % (
+                ' '.join(commands), result.returncode, (result.stdout or '').strip()
+            )
+        )
 
     if output_stream:
         output_stream.seek(0)
+
+    return result.returncode == 0
+
+
+def merge_pending(pending, remove_rr, add_rr):
+    """ merge a pending (not yet applied) batch with a newly generated one.
+        pending adds whose name is removed again in the new batch are stale and dropped.
+    """
+    pending_remove_rr, pending_add_rr = pending
+    removed_names = set(remove_rr)
+    add_rr = [rr for rr in pending_add_rr if rr.split()[0] not in removed_names] + add_rr
+    return list(dict.fromkeys(pending_remove_rr + remove_rr)), list(dict.fromkeys(add_rr))
+
+
+def update_unbound(remove_rr, add_rr):
+    """ apply a batch to unbound.
+        :return: (pending batch to retry, success)
+    """
+    if remove_rr and not unbound_control(['local_datas_remove'], input=remove_rr):
+        # nothing applied, retry the whole batch (the adds compensate for the removes, keep them together)
+        return (remove_rr, add_rr), False
+    if add_rr and not unbound_control(['local_datas'], input=add_rr):
+        # possibly partially applied, a reload of the local data followed by a reconcile regenerates the adds
+        return ([], []), False
+    return ([], []), True
+
 
 class UnboundLocalData:
     def __init__(self):
         self._map_by_address = dict()
         self._map_by_fqdn = dict()
         with tempfile.NamedTemporaryFile() as output_stream:
-            unbound_control(['list_local_data'], output_stream=output_stream)
+            self.loaded = unbound_control(['list_local_data'], output_stream=output_stream)
+            if not self.loaded:
+                return
             for line in output_stream:
                 parts = line.decode().split()
                 if len(parts) > 4 and parts[3] == 'A' and parts[4] != '0.0.0.0':
@@ -140,8 +178,26 @@ def run_watcher(target_filename, default_domain, watch_file, config):
 
     # start watching dhcp leases
     last_cleanup = time.time()
+    # unbound-control failure handling: reload local data and reconcile after an exponential backoff
+    max_backoff = 60
+    failures = 0
+    retry_after = 0
+    reload_needed = not unbound_local_data.loaded
+    force_reconcile = False
+    pending = ([], [])
     while True:
-        dhcpd_changed = False
+        if reload_needed and time.time() >= retry_after:
+            unbound_local_data = UnboundLocalData()
+            reload_needed = not unbound_local_data.loaded
+            if reload_needed:
+                failures += 1
+                retry_after = time.time() + min(2 ** failures, max_backoff)
+            else:
+                force_reconcile = True
+        unbound_ready = not reload_needed and time.time() >= retry_after
+
+        dhcpd_changed = force_reconcile
+        force_reconcile = False
         for lease in dhcpdleases.watch():
             if 'ends' in lease and lease['ends'] > time.time() \
                     and 'client-hostname' in lease and 'address' in lease and lease['client-hostname']:
@@ -193,8 +249,10 @@ def run_watcher(target_filename, default_domain, watch_file, config):
                     unbound_conf.write('local-data: "%s.%s IN A %s"\n' % (
                         cached_leases[address]['client-hostname'], cached_leases[address]['domain'], address)
                     )
-            # signal unbound
-            for address in cached_leases:
+            # signal unbound (the local data map is stale while unbound is unreachable, reconcile after reload)
+            if not unbound_ready:
+                force_reconcile = True
+            for address in cached_leases if unbound_ready else []:
                 fqdn = '%s.%s' % (cached_leases[address]['client-hostname'], cached_leases[address]['domain'])
                 if not unbound_local_data.is_equal(address, fqdn):
                     remove_rr.append(ipaddress.ip_address(address).reverse_pointer)
@@ -207,10 +265,18 @@ def run_watcher(target_filename, default_domain, watch_file, config):
                     unbound_local_data.add_address(address, fqdn)
 
         # Updated unbound
-        if remove_rr:
-            unbound_control(['local_datas_remove'], input=remove_rr)
-        if add_rr:
-            unbound_control(['local_datas'], input=add_rr)
+        remove_rr, add_rr = merge_pending(pending, remove_rr, add_rr)
+        if unbound_ready:
+            pending, updated = update_unbound(remove_rr, add_rr)
+            if updated:
+                failures = 0
+            else:
+                failures += 1
+                retry_after = time.time() + min(2 ** failures, max_backoff)
+                reload_needed = True
+        else:
+            # keep expiry removals (not regenerated by a reconcile) until unbound is reachable again
+            pending = (remove_rr, add_rr)
 
         # wait for next cycle
         time.sleep(1)
